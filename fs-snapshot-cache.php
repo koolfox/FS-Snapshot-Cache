@@ -1,16 +1,16 @@
 <?php
 /**
  * Plugin Name: FS Snapshot Cache
- * Description: Filesystem full-page cache for anonymous visitors (WooCommerce-safe) with gzip/brotli/html snapshots, precise invalidation, admin tools, disk quota sweep — plus optional LCP Boost (with safe exclusions for Gravity Forms + reCAPTCHA).
- * Version: 0.10.0
- * Author: hesum
+ * Description: Filesystem full-page cache for anonymous visitors (WooCommerce-safe) with gzip/brotli/html snapshots, precise invalidation, admin tools, disk quota sweep — plus optional LCP Boost (with safe exclusions for Gravity Forms + reCAPTCHA). Automatically installs an early-serving drop-in (advanced-cache.php).
+ * Version: 0.11.0
+ * Author: hoosh.pro
  */
 
 if (!defined('ABSPATH')) exit;
 
 final class FS_Snapshot_Cache {
     // -------------------- Defaults (overridable via Settings or defines) --------------------
-    const VERSION                = '0.10.0';
+    const VERSION                = '0.11.0';
 
     const DEFAULT_BASE_DIR        = '/cache/html-snapshots';   // under wp-content
     const DEFAULT_VARIANTS        = ['gz'];                    // choose from: gz, br, html
@@ -18,7 +18,7 @@ final class FS_Snapshot_Cache {
     const DEFAULT_ARCHIVE_PAGES   = 3;                         // archive pagination to cache/purge
     const DEFAULT_MAX_TOTAL_BYTES = 1073741824;                // 1 GiB quota
 
-    // NEW: safety defaults
+    // Safety defaults
     const DEFAULT_NO_CACHE_PATHS  = ['/free-estimates/', '/contact/'];
 
     // Handles we never defer (safe for GF/Elementor/Popup Maker/jQuery)
@@ -40,7 +40,13 @@ final class FS_Snapshot_Cache {
         'gravityforms','grecaptcha',
     ];
 
+    // Automations
     const SWEEP_HOOK = 'fs_snapshot_sweep_quota';
+
+    // Drop-in install markers/paths
+    const DROPIN_BASENAME = 'advanced-cache.php';
+    const DROPIN_HEADER   = "/* FS Snapshot Early Cache (managed by fs-snapshot-cache) */";
+    const OPTION_DROPIN_STATE = 'fs_snapshot_dropin_state'; // { installed: bool, ours: bool, reason?: string }
 
     public function __construct() {
         // Capture just before template output
@@ -77,6 +83,9 @@ final class FS_Snapshot_Cache {
         add_action('admin_post_fs_snapshot_sweep',     [$this, 'handle_sweep_now']);
         add_action('admin_post_fs_snapshot_purge_all', [$this, 'handle_purge_all']);
 
+        // Notices for drop-in / WP_CACHE
+        add_action('admin_notices', [$this, 'maybe_admin_notices']);
+
         // WP-CLI
         if (defined('WP_CLI') && WP_CLI) {
             \WP_CLI::add_command('fs-cache', [$this, 'cli']);
@@ -84,6 +93,8 @@ final class FS_Snapshot_Cache {
 
         // Cron
         add_action(self::SWEEP_HOOK, [$this, 'sweep_quota']);
+
+        // Activate/deactivate hooks
         register_activation_hook(__FILE__,  [__CLASS__, 'activate']);
         register_deactivation_hook(__FILE__, [__CLASS__, 'deactivate']);
 
@@ -102,17 +113,256 @@ final class FS_Snapshot_Cache {
         }
     }
 
+    // -------------------- Activation / Deactivation --------------------
+
     public static function activate() {
+        // Schedule daily sweep
         if (!wp_next_scheduled(self::SWEEP_HOOK)) {
             wp_schedule_event(time() + 300, 'daily', self::SWEEP_HOOK);
         }
+
+        // Ensure WP_CACHE is true (best effort)
+        self::ensure_wp_cache_true();
+
+        // Install advanced-cache.php drop-in (best effort)
+        self::install_dropin();
     }
+
     public static function deactivate() {
         $ts = wp_next_scheduled(self::SWEEP_HOOK);
         if ($ts) wp_unschedule_event($ts, self::SWEEP_HOOK);
+
+        // Remove our drop-in if we installed it (don’t touch if not ours)
+        self::maybe_remove_our_dropin();
     }
 
-    // -------------------- Capture & Store --------------------
+    private static function install_dropin() {
+        $dropin_path = WP_CONTENT_DIR . '/' . self::DROPIN_BASENAME;
+
+        // If a file exists and is NOT ours, do not overwrite.
+        if (is_file($dropin_path) && !self::is_our_dropin($dropin_path)) {
+            update_option(self::OPTION_DROPIN_STATE, ['installed'=>true, 'ours'=>false, 'reason'=>'existing-foreign-dropin'], false);
+            return;
+        }
+
+        // Write our drop-in
+        $bytes = self::dropin_source();
+        $ok = @file_put_contents($dropin_path, $bytes);
+        if ($ok === false) {
+            update_option(self::OPTION_DROPIN_STATE, ['installed'=>false, 'ours'=>false, 'reason'=>'write-failed'], false);
+            return;
+        }
+
+        // Success
+        update_option(self::OPTION_DROPIN_STATE, ['installed'=>true, 'ours'=>true], false);
+    }
+
+    private static function maybe_remove_our_dropin() {
+        $dropin_path = WP_CONTENT_DIR . '/' . self::DROPIN_BASENAME;
+        if (is_file($dropin_path) && self::is_our_dropin($dropin_path)) {
+            @unlink($dropin_path);
+        }
+        delete_option(self::OPTION_DROPIN_STATE);
+    }
+
+    private static function is_our_dropin($path): bool {
+        $fh = @fopen($path, 'r');
+        if (!$fh) return false;
+        $head = fread($fh, 256);
+        fclose($fh);
+        return (strpos((string)$head, self::DROPIN_HEADER) !== false);
+    }
+
+    private static function ensure_wp_cache_true() {
+        if (defined('WP_CACHE') && WP_CACHE) return;
+
+        $wp_config = self::locate_wp_config_path();
+        if (!$wp_config || !is_writable($wp_config)) {
+            // We’ll show an admin notice
+            return;
+        }
+
+        $contents = @file_get_contents($wp_config);
+        if ($contents === false) return;
+
+        if (strpos($contents, 'define(\'WP_CACHE\'') !== false || strpos($contents, 'define("WP_CACHE"') !== false) {
+            // Try to flip to true if set false
+            $contents = preg_replace('/define\(\s*[\'"]WP_CACHE[\'"]\s*,\s*false\s*\)\s*;/', 'define(\'WP_CACHE\', true);', $contents, 1);
+        } else {
+            // Insert just after opening <?php
+            $contents = preg_replace('/<\?php\s*/', "<?php\ndefine('WP_CACHE', true);\n", $contents, 1);
+        }
+
+        @file_put_contents($wp_config, $contents);
+    }
+
+    private static function locate_wp_config_path() {
+        // Typical path
+        $path = ABSPATH . 'wp-config.php';
+        if (is_file($path)) return $path;
+
+        // One directory up (some setups)
+        $path = dirname(ABSPATH) . '/wp-config.php';
+        if (is_file($path)) return $path;
+
+        return null;
+    }
+
+    private static function dropin_source(): string {
+        // This is the exact early-serving logic you provided, wrapped with our header marker.
+        return <<<'PHP'
+<?php
+/* FS Snapshot Early Cache (managed by fs-snapshot-cache) */
+/**
+ * Safe early-serving of static snapshots before WordPress loads.
+ * Serves .br or .gz files if present and valid; falls through to WP otherwise.
+ * Avoids serving 0-byte or truncated files.
+ *
+ * Optional overrides in wp-config.php:
+ *   define('FS_SNAPSHOT_BASE_DIR', '/cache/html-snapshots'); // under wp-content (default)
+ *   define('FS_SNAPSHOT_VARIANTS', ['gz','br']);             // any of ['gz','br','html'] (html is NOT served here)
+ */
+
+if (defined('WP_INSTALLING')) return;
+
+// ---- Tunables (safe defaults) ----
+if (!defined('FS_SNAPSHOT_MIN_BYTES')) define('FS_SNAPSHOT_MIN_BYTES', 1024); // min valid filesize for a snapshot
+
+// Resolve base snapshots directory (under wp-content)
+function fsac_base_dir() {
+    $rel = defined('FS_SNAPSHOT_BASE_DIR') ? FS_SNAPSHOT_BASE_DIR : '/cache/html-snapshots';
+    if ($rel === '' || $rel[0] !== '/') $rel = '/'.$rel; // ensure leading slash
+    return rtrim(WP_CONTENT_DIR, '/') . $rel;
+}
+
+// Should we attempt early serve for this request?
+function fsac_allowed(): bool {
+    // Only GET/HEAD
+    $m = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+    if ($m !== 'GET' && $m !== 'HEAD') return false;
+
+    // Not logged in
+    foreach (array_keys($_COOKIE ?? []) as $c) {
+        if (stripos($c, 'wordpress_logged_in_') === 0) return false;
+    }
+
+    // Woo critical paths
+    $uri = $_SERVER['REQUEST_URI'] ?? '/';
+    if (preg_match('~/(cart|checkout|my-account|order-pay|order-received)(/|$)~i', $uri)) return false;
+
+    // No query string
+    if (!empty($_GET)) return false;
+
+    // No active cart cookies
+    $cookies = array_change_key_case($_COOKIE ?? [], CASE_LOWER);
+    if (!empty($cookies['woocommerce_items_in_cart']) || !empty($cookies['woocommerce_cart_hash'])) return false;
+
+    return true;
+}
+
+// Normalize request path and build stable cache key
+function fsac_norm_path($p) {
+    $p = parse_url($p ?: '/', PHP_URL_PATH) ?? '/';
+    $p = preg_replace('~//+~', '/', $p);
+    return substr($p, -1) === '/' ? $p : $p . '/';
+}
+function fsac_key(): string {
+    $https  = !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
+    $scheme = $https ? 'https' : 'http';
+    $host   = strtolower($_SERVER['HTTP_HOST'] ?? 'localhost');
+    $path   = fsac_norm_path($_SERVER['REQUEST_URI'] ?? '/');
+    return md5($scheme . '://' . $host . $path);
+}
+
+// Map key to shard paths
+function fsac_paths($key) {
+    $a = substr($key, 0, 2);
+    $b = substr($key, 2, 2);
+    $dir = fsac_base_dir() . '/' . $a . '/' . $b;
+    return [
+        'br'   => $dir . '/' . $key . '.br',
+        'gz'   => $dir . '/' . $key . '.gz',
+        'html' => $dir . '/' . $key . '.html',
+        'dir'  => $dir,
+    ];
+}
+
+// Is this snapshot file OK?
+function fsac_ok_file($path): bool {
+    return is_file($path) && filesize($path) > FS_SNAPSHOT_MIN_BYTES;
+}
+
+// Emit common cache headers
+function fsac_send_common_headers() {
+    header('Vary: Accept-Encoding, Cookie', true);
+    header('Cache-Control: public, max-age=300, stale-while-revalidate=30, stale-if-error=86400', true);
+    header('Content-Type: text/html; charset=UTF-8', true);
+}
+
+// Optionally handle conditional requests (304)
+function fsac_maybe_conditional_304($file) {
+    $mtime = @filemtime($file);
+    if (!$mtime) return false;
+    $lastMod = gmdate('D, d M Y H:i:s', $mtime) . ' GMT';
+    header('Last-Modified: ' . $lastMod, true);
+
+    if (!empty($_SERVER['HTTP_IF_MODIFIED_SINCE'])) {
+        $since = strtotime($_SERVER['HTTP_IF_MODIFIED_SINCE']);
+        if ($since && $since >= $mtime) {
+            header('X-FS-Early-Result: not-modified');
+            http_response_code(304);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ------------ Main flow ------------
+$allowed = fsac_allowed();
+if (!headers_sent()) {
+    header('X-FS-Early: ' . ($allowed ? 'allowed' : 'bypass'));
+}
+if (!$allowed) return;
+
+$key = fsac_key();
+$paths = fsac_paths($key);
+$ae = $_SERVER['HTTP_ACCEPT_ENCODING'] ?? '';
+
+if (!headers_sent()) {
+    header('X-FS-Cache-Key: ' . substr($key, 0, 12));
+    header('X-FS-Dir: ' . $paths['dir']);
+}
+
+// Prefer Brotli, then gzip. (We intentionally do NOT serve raw HTML here.)
+if (stripos($ae, 'br') !== false && fsac_ok_file($paths['br'])) {
+    if (fsac_maybe_conditional_304($paths['br'])) exit;
+    fsac_send_common_headers();
+    header('Content-Encoding: br', true);
+    header('X-Snapshot: FILE-BROTLI');
+    header('X-FS-Early-Result: hit-br');
+    readfile($paths['br']); exit;
+}
+if (stripos($ae, 'gzip') !== false && fsac_ok_file($paths['gz'])) {
+    if (fsac_maybe_conditional_304($paths['gz'])) exit;
+    fsac_send_common_headers();
+    header('Content-Encoding: gzip', true);
+    header('X-Snapshot: FILE-GZIP');
+    header('X-FS-Early-Result: hit-gz');
+    readfile($paths['gz']); exit;
+}
+
+// Miss or bad files: cleanup any 0-byte artifacts and fall through
+foreach (['br','gz','html'] as $v) {
+    $p = $paths[$v] ?? null;
+    if ($p && is_file($p) && filesize($p) === 0) @unlink($p);
+}
+
+if (!headers_sent()) header('X-FS-Early-Result: miss');
+// Fall through so WordPress can render; the plugin will write a fresh snapshot.
+PHP;
+    }
+
+    // -------------------- Capture & Store (unchanged core) --------------------
 
     public function maybe_start_buffer() {
         $reason = '';
@@ -178,7 +428,6 @@ final class FS_Snapshot_Cache {
     // -------------------- Cacheability --------------------
 
     private function is_cacheable(?string &$reason = null): bool {
-        // Allow external overrides
         $pre = apply_filters('fs_snapshot_pre_cacheable', null, $reason);
         if ($pre !== null) { $reason = is_string($pre) ? $pre : 'filtered'; return (bool)$pre; }
 
@@ -197,7 +446,6 @@ final class FS_Snapshot_Cache {
         if (stripos($uri, 'add-to-cart=') !== false) { $reason = 'add-to-cart'; return false; }
         if (stripos($uri, '/wc-ajax/') !== false)    { $reason = 'wc-ajax';     return false; }
 
-        // NEW: do-not-cache paths (from settings + constants + defaults)
         $no_cache_paths = $this->no_cache_paths();
         foreach ($no_cache_paths as $path) {
             if ($path !== '' && stripos($uri, $path) !== false) {
@@ -206,7 +454,6 @@ final class FS_Snapshot_Cache {
             }
         }
 
-        // Allow external veto after our checks
         $ok = (is_singular() || is_front_page() || is_home() || is_archive());
         $ok = (bool)apply_filters('fs_snapshot_cacheable', $ok, $uri);
         $reason = $ok ? 'ok' : 'view-not-whitelisted';
@@ -219,7 +466,7 @@ final class FS_Snapshot_Cache {
         return trailingslashit(home_url($path));
     }
 
-    // -------------------- Invalidation --------------------
+    // -------------------- Invalidation (unchanged) --------------------
 
     public function on_status_change($new, $old, $post) {
         if (isset($post->ID)) $this->purge_post_related((int)$post->ID);
@@ -384,7 +631,7 @@ final class FS_Snapshot_Cache {
         wp_safe_redirect($url); exit;
     }
 
-    // -------------------- Settings --------------------
+    // -------------------- Settings (unchanged UI) --------------------
 
     public function add_settings_page() {
         add_options_page('FS Snapshot Cache', 'FS Snapshot Cache', 'manage_options', 'fs-snapshot-cache', [$this, 'render_settings_page']);
@@ -403,7 +650,7 @@ final class FS_Snapshot_Cache {
                 $bd = trim($in['base_dir'] ?? self::DEFAULT_BASE_DIR);
                 $out['base_dir'] = $bd === '' ? self::DEFAULT_BASE_DIR : (strpos($bd,'/')===0 ? $bd : '/'.$bd);
 
-                // NEW: no-cache paths (textarea, one per line)
+                // No-cache paths
                 $nc = isset($in['no_cache_paths']) ? (string)$in['no_cache_paths'] : '';
                 $lines = array_filter(array_map('trim', preg_split('#\R+#', $nc)));
                 $out['no_cache_paths'] = $lines ?: self::DEFAULT_NO_CACHE_PATHS;
@@ -415,8 +662,6 @@ final class FS_Snapshot_Cache {
                 $out['lcp_preconnect_gfonts']    = !empty($in['lcp_preconnect_gfonts']);
                 $out['lcp_font_preload_url']     = esc_url_raw($in['lcp_font_preload_url'] ?? '');
                 $out['lcp_critical_css']         = (string)($in['lcp_critical_css'] ?? '');
-
-                // NEW: defer exclusions
                 $out['lcp_default_exclusions']   = !empty($in['lcp_default_exclusions']);
 
                 // Handles (comma/space separated)
@@ -447,6 +692,9 @@ final class FS_Snapshot_Cache {
         ?>
         <div class="wrap">
           <h1>FS Snapshot Cache</h1>
+
+          <?php $this->render_dropin_status_box(); ?>
+
           <form method="post" action="options.php">
             <?php settings_fields('fs_snapshot_group'); ?>
 
@@ -553,6 +801,27 @@ final class FS_Snapshot_Cache {
         <?php
     }
 
+    private function render_dropin_status_box() {
+        $state = get_option(self::OPTION_DROPIN_STATE, []);
+        $dropin_path = WP_CONTENT_DIR . '/' . self::DROPIN_BASENAME;
+        $have = is_file($dropin_path);
+        $ours = $have && self::is_our_dropin($dropin_path);
+        $wp_cache_on = defined('WP_CACHE') && WP_CACHE;
+
+        echo '<div class="notice notice-info" style="padding:12px;margin-top:10px;">';
+        echo '<strong>Early-serving drop-in:</strong> ';
+        if ($have) {
+            echo $ours ? 'installed (managed by plugin).' : 'present (managed by another plugin/system).';
+        } else {
+            echo 'not installed.';
+        }
+        echo '<br><strong>WP_CACHE:</strong> ' . ($wp_cache_on ? 'enabled' : 'disabled');
+        if (!$wp_cache_on) {
+            echo '<br><em>Add this to wp-config.php:</em> <code>define(\'WP_CACHE\', true);</code>';
+        }
+        echo '</div>';
+    }
+
     public function handle_sweep_now() {
         if (!current_user_can('manage_options')) wp_die('forbidden');
         check_admin_referer('fs_snapshot_sweep');
@@ -582,63 +851,58 @@ final class FS_Snapshot_Cache {
      *   wp fs-cache purge --url=https://site.tld/about-us/
      */
     public function cli($args, $assoc) {
-    $sub = $args[0] ?? 'warm';
-    if ($sub === 'purge' && !empty($assoc['url'])) {
-        $this->purge_url(untrailingslashit($assoc['url']).'/');
-        \WP_CLI::success('Purged: '.$assoc['url']);
-        return;
-    }
-
-    $what  = $assoc['what']  ?? 'all'; // all|home|posts|products|archives
-    $limit = (int)($assoc['limit'] ?? 500);
-    $urls  = [];
-
-    if ($what === 'all' || $what === 'home') {
-        $urls[] = trailingslashit(home_url('/'));
-    }
-
-    if ($what === 'all' || $what === 'posts') {
-        $q = new \WP_Query([
-            'post_type'      => ['post','page'],
-            'post_status'    => 'publish',
-            'fields'         => 'ids',
-            'posts_per_page' => $limit,
-            'no_found_rows'  => true
-        ]);
-        foreach ($q->posts as $id) {
-            $urls[] = trailingslashit(get_permalink($id));
+        $sub = $args[0] ?? 'warm';
+        if ($sub === 'purge' && !empty($assoc['url'])) {
+            $this->purge_url(untrailingslashit($assoc['url']).'/');
+            \WP_CLI::success('Purged: '.$assoc['url']);
+            return;
         }
-    }
 
-    if (class_exists('WooCommerce') && ($what === 'all' || $what === 'products')) {
-        $q = new \WP_Query([
-            'post_type'      => ['product'],
-            'post_status'    => 'publish',
-            'fields'         => 'ids',
-            'posts_per_page' => $limit,
-            'no_found_rows'  => true
-        ]);
-        foreach ($q->posts as $id) {
-            $urls[] = trailingslashit(get_permalink($id));
+        $what  = $assoc['what']  ?? 'all'; // all|home|posts|products|archives
+        $limit = (int)($assoc['limit'] ?? 500);
+        $urls  = [];
+
+        if ($what === 'all' || $what === 'home') {
+            $urls[] = trailingslashit(home_url('/'));
         }
+
+        if ($what === 'all' || $what === 'posts') {
+            $q = new \WP_Query([
+                'post_type'      => ['post','page'],
+                'post_status'    => 'publish',
+                'fields'         => 'ids',
+                'posts_per_page' => $limit,
+                'no_found_rows'  => true
+            ]);
+            foreach ($q->posts as $id) $urls[] = trailingslashit(get_permalink($id));
+        }
+
+        if (class_exists('WooCommerce') && ($what === 'all' || $what === 'products')) {
+            $q = new \WP_Query([
+                'post_type'      => ['product'],
+                'post_status'    => 'publish',
+                'fields'         => 'ids',
+                'posts_per_page' => $limit,
+                'no_found_rows'  => true
+            ]);
+            foreach ($q->posts as $id) $urls[] = trailingslashit(get_permalink($id));
+        }
+
+        if ($what === 'all' || $what === 'archives') {
+            $pta = post_type_exists('product') ? get_post_type_archive_link('product') : null;
+            if ($pta) $urls[] = trailingslashit($pta);
+        }
+
+        $urls = array_values(array_unique(array_filter($urls)));
+        foreach ($urls as $u) {
+            \WP_CLI::line("Render $u");
+            $resp = wp_remote_get($u, ['timeout'=>10, 'headers'=>['Cache-Prime'=>'1']]);
+            if (is_wp_error($resp)) \WP_CLI::warning($resp->get_error_message());
+        }
+        \WP_CLI::success('Warmup done ('.count($urls).' URLs).');
     }
 
-    if ($what === 'all' || $what === 'archives') {
-        $pta = post_type_exists('product') ? get_post_type_archive_link('product') : null;
-        if ($pta) $urls[] = trailingslashit($pta);
-    }
-
-    $urls = array_values(array_unique(array_filter($urls)));
-    foreach ($urls as $u) {
-        \WP_CLI::line("Render $u");
-        $resp = wp_remote_get($u, ['timeout'=>10, 'headers'=>['Cache-Prime'=>'1']]);
-        if (is_wp_error($resp)) \WP_CLI::warning($resp->get_error_message());
-    }
-    \WP_CLI::success('Warmup done ('.count($urls).' URLs).');
-    }
-
-
-    // -------------------- LCP Boost (image + text/H1) --------------------
+    // -------------------- LCP Boost (same as before) --------------------
 
     public function lcp_inline_critical_css() {
         $css = trim((string)$this->opt('lcp_critical_css',''));
@@ -646,7 +910,6 @@ final class FS_Snapshot_Cache {
         echo "\n<style id='fs-critical-css'>\n{$css}\n</style>\n";
     }
 
-    // Preload likely LCP image (featured or main product image)
     public function lcp_preload_image() {
         if (is_admin()) return;
         $img_url = ''; $srcset=''; $sizes='';
@@ -674,7 +937,6 @@ final class FS_Snapshot_Cache {
         }
     }
 
-    // Featured/product image: eager + high priority
     public function lcp_featured_img_attrs($attr, $attachment, $size) {
         if (is_singular() && get_post_thumbnail_id() === $attachment->ID) {
             $attr['loading'] = 'eager';
@@ -694,7 +956,6 @@ final class FS_Snapshot_Cache {
         return $attr;
     }
 
-    // Product pages: force the first inline <img> eager/high
     public function lcp_first_img_eager_on_product($html) {
         if (!function_exists('is_product') || !is_product()) return $html;
         return preg_replace_callback('#<img[^>]*>#i', function($m){
@@ -734,9 +995,6 @@ final class FS_Snapshot_Cache {
         wp_add_inline_style('fs-lcp-dummy', '@font-face{font-display:swap !important;}');
     }
 
-    /**
-     * Add defer to most scripts, but NEVER to critical ones (GF/reCAPTCHA/Elementor/PopupMaker/jQuery)
-     */
     public function lcp_defer_scripts($tag, $handle, $src){
         if (is_admin()) return $tag;
 
@@ -749,10 +1007,7 @@ final class FS_Snapshot_Cache {
             $ex_handles = array_merge($ex_handles, self::DEFAULT_DEFER_EXCLUDE_HANDLES);
         }
         $ex_handles = array_merge($ex_handles, (array)$this->opt('defer_exclude_handles', []));
-
-        // Allow filter override
         $ex_handles = apply_filters('fs_snapshot_defer_exclude_handles', array_values(array_unique($ex_handles)));
-
         if (in_array($handle, $ex_handles, true)) return $tag;
 
         $ex_subs = [];
@@ -760,8 +1015,6 @@ final class FS_Snapshot_Cache {
             $ex_subs = array_merge($ex_subs, self::DEFAULT_DEFER_EXCLUDE_URL_SUBSTR);
         }
         $ex_subs = array_merge($ex_subs, (array)$this->opt('defer_exclude_substrings', []));
-
-        // Allow filter override
         $ex_subs = apply_filters('fs_snapshot_defer_exclude_substrings', array_values(array_unique($ex_subs)));
 
         $lower = strtolower((string)$src);
@@ -769,10 +1022,10 @@ final class FS_Snapshot_Cache {
             if ($needle !== '' && strpos($lower, strtolower($needle)) !== false) return $tag;
         }
 
-        // 3) If already module or already deferred, leave it
+        // Already module or deferred?
         if (strpos($tag, ' type="module"') !== false || strpos($tag, ' defer ') !== false) return $tag;
 
-        // 4) Add defer without touching inline scripts
+        // Add defer
         $tag = str_replace(' src', ' defer src', $tag);
         return $tag;
     }
@@ -792,6 +1045,30 @@ final class FS_Snapshot_Cache {
         $defaults = $include_defaults ? self::DEFAULT_NO_CACHE_PATHS : [];
         $all = array_values(array_unique(array_filter(array_map('trim', array_merge($defaults, $const, $user)))));
         return apply_filters('fs_snapshot_no_cache_paths', $all);
+    }
+
+    public function maybe_admin_notices() {
+        if (!current_user_can('manage_options')) return;
+
+        $state = get_option(self::OPTION_DROPIN_STATE, []);
+        $dropin_path = WP_CONTENT_DIR . '/' . self::DROPIN_BASENAME;
+        $have = is_file($dropin_path);
+        $ours = $have && self::is_our_dropin($dropin_path);
+
+        // WP_CACHE off?
+        if (!(defined('WP_CACHE') && WP_CACHE)) {
+            echo '<div class="notice notice-warning"><p><strong>FS Snapshot Cache:</strong> <code>WP_CACHE</code> is disabled. For early serving, add <code>define(\'WP_CACHE\', true);</code> to your <code>wp-config.php</code>.</p></div>';
+        }
+
+        // Drop-in write failure?
+        if (!$have && !empty($state['reason']) && $state['reason']==='write-failed') {
+            echo '<div class="notice notice-error"><p><strong>FS Snapshot Cache:</strong> Could not write <code>wp-content/advanced-cache.php</code>. Please make <code>wp-content</code> writable and re-activate the plugin, or create the file manually.</p></div>';
+        }
+
+        // Foreign drop-in present
+        if ($have && !$ours) {
+            echo '<div class="notice notice-info"><p><strong>FS Snapshot Cache:</strong> Another plugin/system manages <code>advanced-cache.php</code>. We will not overwrite it.</p></div>';
+        }
     }
 }
 
