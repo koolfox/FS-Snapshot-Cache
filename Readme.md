@@ -153,7 +153,7 @@ wp fs-cache purge --url=https://example.com/about/
 
 ## License
 
-GPLv2 or later
+MIT
 
 ---
 
